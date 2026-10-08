@@ -1,0 +1,4 @@
+EmployeeID,GivenName,Surname,DOB,EmailAddress,CoverStart,CoverEnd
+BE-2001,Grace,Hopper,09/12/1960,grace.hopper@example.com,01/01/2024,31/12/2025
+BE-2002,Ada,Lovelace,27/12/1975,,01/01/2024,31/12/2025
+BE-2003,Alan,Turing,23/06/1982,alan.turing@example.com,01/01/2024,31/12/2025
