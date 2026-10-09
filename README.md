@@ -80,6 +80,28 @@ depends on `domain` types — it never branches on a specific partner.
   summary reports every such collision by id and row numbers so it's
   never silently resolved.
 
+## Assumptions
+
+Things the exercise left open that I decided rather than asked about, because
+they're implementation details a reviewer wouldn't need to weigh in on:
+
+- Each CSV file belongs to exactly one partner, supplied out-of-band (CLI
+  flag / query param / header) — the file itself never states which partner
+  it's from, so there's nothing to cross-check it against.
+- A file always has a header row whose names match the active profile's
+  `columnMap`. If they don't, the importer now fails fast with a named
+  "missing column" error rather than silently rejecting every row (see
+  Known limitations for what this doesn't catch).
+- One SQLite file per "deployment" is enough durability for this exercise —
+  no replication, backup, or concurrent-writer story.
+- `partner_member_id` is an opaque string; no format is assumed beyond
+  "non-empty" (real partner ids could be numeric, alphanumeric, padded, etc).
+- The six bigger, user-visible gaps (storage engine, member-identity key,
+  lookup transport, how genericity is achieved, validation strictness, which
+  fields are required) were **not** my calls to make silently — those are
+  recorded as explicit decisions below, made by answering direct questions
+  rather than guessing.
+
 ## Canonical fields
 
 `partner_member_id, first_name, last_name, date_of_birth, email, policy_start, policy_end`
@@ -160,6 +182,32 @@ Three layers, all under `test/`, run with `npm test` (vitest):
 Out of scope (per spec): load/performance testing and testing against
 real partner data — only the sample CSVs are used.
 
+## How correctness was checked
+
+Beyond the test suite (above), every change went through an explicit
+verification pass, not just "tests pass":
+
+- **Typecheck + build**: `tsc --noEmit` and a full `tsc` build, zero errors.
+- **Manual end-to-end runs**: imported the real sample files twice each
+  (first run's accepted/rejected/duplicate counts checked by hand against
+  what the CSV actually contains; second run confirmed 0 inserted/0
+  updated); started the HTTP server and `curl`'d a hit, a miss, and the
+  header-based partner-scoping path.
+- **I/O matrix coverage audit**: every row of the spec's edge-case matrix
+  (happy path, re-import unchanged, update-on-change, missing field,
+  malformed date, `policy_end` before `policy_start`, in-file duplicate,
+  lookup hit/miss) was matched against a specific passing test, not
+  assumed covered by "tests pass."
+- **Three independent automated review passes** against the full diff —
+  one hunting for missing handling generally, one tracing every branch and
+  boundary the diff touches for an unhandled path, one specifically
+  checking whether a regression in the changed behaviour would actually
+  be caught by a test. Each finding was then independently re-verified
+  (re-read the code, in two cases ran a small Node snippet to confirm the
+  claim) before deciding what to do with it — a reviewer's claim was
+  treated as a hypothesis, not a fact. See "How AI was used" below for
+  what that process actually caught.
+
 ## Known limitations / left incomplete
 
 - No batch/multi-file orchestration, scheduling, or auth — out of scope
@@ -167,5 +215,69 @@ real partner data — only the sample CSVs are used.
 - The email format check is a pragmatic regex (`local@domain.tld`
   shape), not full RFC 5322 validation.
 - `partner_id` is trusted as supplied (CLI flag / query param / header);
-  there is no partner registry beyond the two sample `SourceProfile`s
-  checked into `src/profiles/`.
+  the HTTP lookup doesn't distinguish "unknown partner" from "unknown
+  member" — both return the same clean 404, which satisfies the spec but
+  gives no signal that the partner itself was mistyped.
+- `memberIdentity`/`identityKey` in `src/domain/member.ts` are documented
+  as *the* place member identity is computed, but `SqliteStore` and the
+  importer's in-file duplicate detection both still compare
+  `partner_id`/`partner_member_id` inline rather than calling them. They
+  agree today; it's a latent inconsistency if identity rules ever change,
+  not a current bug.
+- The `MM/DD/YYYY` date format is implemented and tested but not used by
+  either shipped profile — included for completeness, not because a
+  partner needs it yet.
+
+## How AI was used
+
+I built this with Claude Code end-to-end, using a spec-first workflow
+rather than asking it to "just write the importer." Roughly:
+
+1. **Spec first.** I gave Claude the exercise text and asked it to turn it
+   into a spec and surface everything the brief left unsaid, rather than
+   guessing. It came back with six concrete open questions — storage
+   engine, what makes two rows "the same member," how lookup should be
+   exposed, how to make the design generic across partners, how strict
+   validation should be, and which fields are actually required. I
+   answered each one directly; those answers are the "Decisions" section
+   above. This is where AI helped most: it turned a loosely-specified
+   exercise into a short list of decisions I actually had to make, instead
+   of me discovering them one-by-one while reading generated code.
+2. **Implementation from the spec.** Claude then implemented the whole
+   pipeline (domain types, profiles, CSV reader, validator, SQLite store,
+   importer, CLI, HTTP server, sample data, tests, this README) from that
+   spec in one pass. This is where AI is fastest but weakest unsupervised:
+   the first pass was functionally complete and all tests passed, but it
+   had several real correctness gaps that only surfaced under targeted
+   review (next step), not from writing more code faster.
+3. **Independent automated review, then verification, then fixes.** Rather
+   than trusting "tests are green," I ran three differently-focused
+   automated review passes against the actual diff (described above) and
+   independently re-verified every finding before acting — several were
+   false positives or already-safe behaviour that got rejected, not
+   patched. Six were real and got fixed:
+   - a CSV row with a different column count than the header crashed the
+     *entire* import, contradicting the spec's "one bad row never aborts
+     the import" rule — not something either of us noticed until the
+     review traced that code path on purpose;
+   - the CLI's argument/partner-id/file-read errors weren't caught
+     anywhere, so a typo in `--partner` crashed with a raw stack trace;
+   - a mismatched profile/CSV pairing (wrong profile, or a stale column
+     map) silently turned every row into a generic rejection instead of a
+     clear "this file doesn't match this profile" error;
+   - the HTTP server could crash on startup (no database directory yet)
+     or on a busy port (no listener on the socket's error event);
+   - a genuine but obscure date-handling bug: `Date.UTC` treats a
+     4-digit year in `0`-`99` as `1900+year`, which would have wrongly
+     rejected a literal year like `0099` as an invalid date.
+   None of these were caught by the test suite passing — they needed
+   someone (or something) to deliberately ask "what happens when X"
+   rather than confirm the happy path works. That's the gap AI tooling
+   closed here: not writing the code, but systematically interrogating it
+   afterwards. The things AI did *not* do on its own: decide the six open
+   questions above, or decide which of the review's ~15 findings were
+   worth fixing versus noise (e.g. it correctly flagged that
+   `memberIdentity` isn't actually called by the store or importer, but
+   whether that's worth fixing now or later was a judgment call, not an
+   automatic one — I deferred it, logged in the spec, since nothing is
+   broken today).
