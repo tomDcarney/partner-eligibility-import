@@ -34,14 +34,7 @@ function main(): void {
   let store: SqliteStore | undefined;
 
   try {
-    const [, , command, ...rest] = process.argv;
-
-    if (command !== 'import') {
-      console.error('Usage: npm run import -- <file.csv> --partner <partnerId> [--db <path>]');
-      process.exitCode = 1;
-      return;
-    }
-
+    const rest = process.argv.slice(2);
     const { file, partnerId, dbPath } = parseArgs(rest);
     const profile = loadProfile(partnerId);
 
